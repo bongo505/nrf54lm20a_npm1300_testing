@@ -115,7 +115,9 @@ void setup() {
   delay(1000);
 
   pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
   digitalWrite(LED_GREEN, ledFlag);
+  digitalWrite(LED_RED, !ledFlag);
 
   if (!npm1300_is_present()) {
     OutputSerial.println("nPM1300 not found");
@@ -204,5 +206,6 @@ void loop() {
 
   ledFlag = !ledFlag;
   digitalWrite(LED_GREEN, ledFlag);
+  digitalWrite(LED_RED, !ledFlag);
 
 }
