@@ -1,0 +1,12 @@
+{
+  "name": "nrf_fuel_gauge",
+  "version": "1.0.0",
+  "description": "Nordic nRF Fuel Gauge, precompiled (cortex-m33, soft-float, secondary cell)",
+  "build": {
+    "flags": [
+      "-Iinclude",
+      "-L.",
+      "-lnrf_fuel_gauge"
+    ]
+  }
+}
