@@ -1,137 +1,53 @@
 /*
- * nPM1300 + Nordic nRF Fuel Gauge test with persistence and a low-battery
- * trigger (XIAO nRF54LM20A). PlatformIO: src/main.cpp. UNTESTED draft.
+ * nPM1300 fuel gauge example (XIAO nRF54LM20A)
  *
- * Reads battery voltage and current from the nPM1300, feeds them to Nordic's
- * fuel gauge library once a second and prints the state of charge.
+ * Feeds battery voltage and current from the nPM1300 to Nordic's nRF Fuel
+ * Gauge library once a second and prints the estimated state of charge.
  *
- * Persistence: a small record (state of health, cycle count, charge since the
- * last full cycle) is kept in the core's EEPROM library (CRC-protected RRAM).
- * It is written only when it has changed meaningfully, not on every wake.
- *
- * Low battery: when running on battery with a low state of charge or voltage
- * for several readings in a row, the record is saved once.
+ * The library and a battery model are NOT part of this core. See
+ * docs/npm1300_fuel_gauge.md for where to get them and how to add them to a
+ * PlatformIO project.
  *
  * Needs:
- *  - lib/nrf_fuel_gauge with libnrf_fuel_gauge.a (cortex-m33, soft-float,
- *    secondary cell variant).
- *  - src/battery_model.inc: the LP503030 model.
- *  - npm1300_read_ibat_signed_ma() in the nPM1300 driver.
+ *  - nrf_fuel_gauge.h and libnrf_fuel_gauge.a (cortex-m33, soft-float,
+ *    secondary cell / rechargeable variant)
+ *  - battery_model.inc for your battery, next to this file
+ *  - npm1300_read_ibat_signed_ma() in the nPM1300 driver
  *
- * Assumptions to check:
- *  - Current sign: charging positive, discharging negative (CURRENT_SIGN).
- *  - No battery NTC: a fixed temperature is used.
+ * Notes:
+ *  - The library wants DISCHARGE-positive current. The driver's signed read is
+ *    charge-positive, so the sign is flipped (LIB_CURRENT_SIGN).
+ *  - The charger does nothing until it is enabled, and the settings below are
+ *    for a 400 mAh Li-Po. Set them for your own battery.
+ *  - This module has no battery NTC reading, so a fixed temperature is used.
  */
 #include <Arduino.h>
-#include <EEPROM.h>
-#include <math.h>
+#include <string.h>
 #include "npm1300.h"
+
+// The library and a battery model are not part of the core. Without them this
+// sketch still builds and just prints a reminder.
+#if __has_include("nrf_fuel_gauge.h") && __has_include("battery_model.inc")
 #include "nrf_fuel_gauge.h"
 
-#define OutputSerial Serial1   // change to Serial for USB output
+#define OutputSerial Serial1   // use Serial1 for a UART adapter
 
 static const struct battery_model battery_model = {
 #include "battery_model.inc"
 };
 
-constexpr float    BATTERY_TEMP_C    = 25.0f;   // no NTC: fixed estimate
-constexpr float    CURRENT_SIGN      = 1.0f;    // +1: charge positive. -1 to flip.
-constexpr uint32_t INTERVAL_MS       = 1000;    // 1 s while active (Nordic's suggestion)
-constexpr float    MIN_BATTERY_V     = 2.5f;    // below this, assume no battery is connected
-constexpr uint16_t CHARGE_CURRENT_MA = 100;     // about 0.25C for a 400 mAh cell
+constexpr float    BATTERY_TEMP_C    = 25.0f;   // no NTC reading: fixed estimate
+constexpr float    LIB_CURRENT_SIGN  = -1.0f;   // library: discharge positive
+constexpr uint32_t INTERVAL_MS       = 1000;    // 1 s while active
+constexpr float    MIN_BATTERY_V     = 2.5f;    // below this, assume no battery
+constexpr uint16_t CHARGE_CURRENT_MA = 100;     // set for your battery (<= 0.5C)
 constexpr uint16_t CHARGE_TERM_MV    = 4200;    // Li-Po termination voltage
+constexpr float    VBAT_OFFSET_V     = 0.02f;    // optional per-board calibration, see the docs
+constexpr bool     PRINT_DEBUG       = true;   // also print the library's internal state
 
-// Persistence
-constexpr uint32_t SAVE_CHECK_MS   = 10UL * 60UL * 1000UL;  // check for changes every 10 min
-constexpr float    SOH_SAVE_STEP   = 0.5f;                  // save if SoH moved this much (%)
-
-// Low battery (only while VBUS is absent)
-constexpr float    CRITICAL_SOC    = 5.0f;      // %
-constexpr float    CRITICAL_V      = 3.3f;      // V, backstop for a mismatched model
-constexpr uint8_t  CRITICAL_COUNT  = 5;         // consecutive readings (about 5 s)
-constexpr bool     SHIP_ON_LOW_BATTERY = false; // true: enter ship mode after saving
-
-// ---------------------------------------------------------------------------
-// Persistent record
-// ---------------------------------------------------------------------------
-struct GaugeRecord {
-  uint32_t magic;       // 'FGRC'
-  uint16_t version;     // bump if this layout changes
-  uint16_t cycles;
-  float    soh;         // percent
-  float    cumMah;      // mAh since the last full cycle
-  uint32_t modelHash;   // hash of battery_model.name
-};
-constexpr uint32_t REC_MAGIC   = 0x43524746UL;
-constexpr uint16_t REC_VERSION = 1;
-
-static GaugeRecord savedRec;
-static bool        haveSaved = false;
-
+static uint32_t lastMs = 0;
 static struct nrf_fuel_gauge_state_info lastInfo;
-static bool haveInfo = false;
 
-static uint32_t hashName(const char *s) {            // FNV-1a
-  uint32_t h = 2166136261UL;
-  while (*s) { h ^= (uint8_t)*s++; h *= 16777619UL; }
-  return h;
-}
-
-static bool loadRecord(GaugeRecord &r) {
-  if (!EEPROM.begin(sizeof(GaugeRecord))) return false;
-  uint8_t *p = (uint8_t *)&r;
-  for (size_t i = 0; i < sizeof(r); i++) p[i] = EEPROM.read(i);
-  return r.magic == REC_MAGIC && r.version == REC_VERSION &&
-         r.modelHash == hashName(battery_model.name) &&
-         isfinite(r.soh) && r.soh >= 50.0f && r.soh <= 120.0f &&
-         isfinite(r.cumMah) && r.cumMah >= 0.0f && r.cycles < 10000;
-}
-
-static bool saveRecord(const GaugeRecord &r) {
-  const uint8_t *p = (const uint8_t *)&r;
-  for (size_t i = 0; i < sizeof(r); i++) EEPROM.write(i, p[i]);   // marks dirty only if a byte changed
-  const uint32_t t0 = micros();
-  bool ok = EEPROM.commit();
-  if (!ok) ok = EEPROM.commit();                                   // one retry: the RRAM lock may be busy
-  OutputSerial.print("record save ");
-  OutputSerial.print(ok ? "ok" : "FAILED");
-  OutputSerial.print(" in ");
-  OutputSerial.print(micros() - t0);
-  OutputSerial.print(" us: soh=");
-  OutputSerial.print(r.soh, 1);
-  OutputSerial.print(" cycles=");
-  OutputSerial.println(r.cycles);
-  return ok;
-}
-
-// Saves the record if SoH, cycle count (or, when forced, the partial-cycle
-// charge) changed meaningfully since the last save.
-static void maybeSaveRecord(bool force) {
-  if (!haveInfo) return;
-  float soh = 0;
-  if (nrf_fuel_gauge_soh_get(&soh) < 0 || !isfinite(soh)) return;
-  if (!isfinite(lastInfo.cycle_count_cumulative_mah)) return;
-
-  GaugeRecord r;
-  memset(&r, 0, sizeof(r));
-  r.magic     = REC_MAGIC;
-  r.version   = REC_VERSION;
-  r.cycles    = lastInfo.cycle_count;
-  r.soh       = soh;
-  r.cumMah    = lastInfo.cycle_count_cumulative_mah;
-  r.modelHash = hashName(battery_model.name);
-
-  const bool changed = !haveSaved ||
-                       r.cycles != savedRec.cycles ||
-                       fabsf(r.soh - savedRec.soh) >= SOH_SAVE_STEP ||
-                       (force && fabsf(r.cumMah - savedRec.cumMah) >= 1.0f);
-  if (!changed) return;
-  if (saveRecord(r)) { savedRec = r; haveSaved = true; }
-}
-
-// ---------------------------------------------------------------------------
-// Charger and library helpers
-// ---------------------------------------------------------------------------
 // Decodes BCHGCHARGESTATUS (charger block 0x34).
 static const char *chargeName(uint8_t s) {
   if (s & 0x40) return "paused (die temp)";
@@ -143,8 +59,6 @@ static const char *chargeName(uint8_t s) {
   return "idle";
 }
 
-// Tells the library about VBUS and the charger state. The header says this is
-// optional, but the library uses it to know when the battery is charging.
 static enum nrf_fuel_gauge_charge_state libChargeState(uint8_t s) {
   if (s & 0x02) return NRF_FUEL_GAUGE_CHARGE_STATE_COMPLETE;
   if (s & 0x10) return NRF_FUEL_GAUGE_CHARGE_STATE_CV;
@@ -153,6 +67,9 @@ static enum nrf_fuel_gauge_charge_state libChargeState(uint8_t s) {
   return NRF_FUEL_GAUGE_CHARGE_STATE_IDLE;
 }
 
+// Tells the library about VBUS and charger state changes. Without this the
+// library does not know when the battery is charging, and the state of charge
+// stays stuck during charging.
 static void updateLibraryChargeInfo(uint8_t chg, uint8_t vbus) {
   static int lastVbus  = -1;
   static int lastState = -1;
@@ -181,19 +98,15 @@ static void updateLibraryChargeInfo(uint8_t chg, uint8_t vbus) {
   }
 }
 
-// Reads battery voltage [V] and current [A] from one ADC burst.
+// Battery voltage [V] and current [A, charge positive] from one ADC burst.
 static bool readBattery(float &v, float &i) {
   const int32_t mv = npm1300_read_vbat_mv();
   int32_t ma = 0;
   if (mv < 0 || !npm1300_read_ibat_signed_ma(&ma)) return false;
-  v = mv / 1000.0f;
-  i = CURRENT_SIGN * (ma / 1000.0f);
+  v = mv / 1000.0f - VBAT_OFFSET_V;   // subtract the measured ADC offset, if you have one
+  i = ma / 1000.0f;
   return true;
 }
-
-// ---------------------------------------------------------------------------
-static uint32_t lastMs        = 0;
-static uint32_t lastSaveCheck = 0;
 
 void setup() {
   OutputSerial.begin(115200);
@@ -213,11 +126,10 @@ void setup() {
   OutputSerial.print(nrf_fuel_gauge_version);
   OutputSerial.print(", variant ");
   OutputSerial.println(nrf_fuel_gauge_variant == NRF_FUEL_GAUGE_VARIANT_SECONDARY
-                     ? "secondary (rechargeable)" : "primary");
+                         ? "secondary (rechargeable)" : "primary");
 
-  // Wait for a battery. Initialising the gauge from a no-battery reading
-  // would start it from a wrong state. For the most accurate start, this
-  // reading should be taken before the radio or LEDs draw current.
+  // Wait for a battery: initialising from a no-battery reading would start the
+  // gauge from a wrong state.
   float v = 0, i = 0;
   while (true) {
     if (readBattery(v, i) && v >= MIN_BATTERY_V) break;
@@ -226,43 +138,21 @@ void setup() {
     delay(1000);
   }
 
-  // Optional configuration, restored from the stored record when it is valid.
-  static struct nrf_fuel_gauge_config_parameters cfg;   // keep valid while the library is in use
-  nrf_fuel_gauge_config_params_default_get(&cfg);
-  cfg.soh_estimate_enable = true;
-
-  GaugeRecord rec;
-  if (loadRecord(rec)) {
-    cfg.soh                        = rec.soh;
-    cfg.cycle_count                = rec.cycles;
-    cfg.cycle_count_cumulative_mah = rec.cumMah;
-    savedRec  = rec;
-    haveSaved = true;
-    OutputSerial.print("restored record: soh=");
-    OutputSerial.print(rec.soh, 1);
-    OutputSerial.print(" cycles=");
-    OutputSerial.println(rec.cycles);
-  } else {
-    OutputSerial.println("no valid record, starting with library defaults");
-  }
-
-  // Filled in by hand: the init macro uses designated initializers in an
-  // order that g++ can reject.
+  // Filled in by hand: the init macro in the header uses designated
+  // initializers in an order that g++ can reject.
   struct nrf_fuel_gauge_init_parameters p;
   memset(&p, 0, sizeof(p));
   p.v0 = v;
-  p.i0 = i;
+  p.i0 = LIB_CURRENT_SIGN * i;
   p.t0 = BATTERY_TEMP_C;
   p.model = &battery_model;
-  p.opt_params = &cfg;
-  p.state = nullptr;
 
   const int ret = nrf_fuel_gauge_init(&p, nullptr);
   OutputSerial.print("nrf_fuel_gauge_init: ");
   OutputSerial.println(ret);
   if (ret < 0) while (true) delay(1000);
 
-  lastMs = lastSaveCheck = millis();
+  lastMs = millis();
 }
 
 void loop() {
@@ -284,64 +174,34 @@ void loop() {
   const bool haveVbus = npm1300_vbus_status(&vbus);
   if (haveChg && haveVbus) updateLibraryChargeInfo(chg, vbus);
 
-  const int ret = nrf_fuel_gauge_process(v, i, BATTERY_TEMP_C, dt, &soc, &lastInfo);
-  if (ret == 0) haveInfo = true;
+  const int ret = nrf_fuel_gauge_process(v, LIB_CURRENT_SIGN * i, BATTERY_TEMP_C, dt, &soc, &lastInfo);
 
   OutputSerial.print("V=");   OutputSerial.print(v, 3);
-  OutputSerial.print(" I=");  OutputSerial.print(i * 1000.0f, 1);
+  OutputSerial.print(" I=");  OutputSerial.print(i * 1000.0f, 1);   // mA, charge positive
   OutputSerial.print(" mA SoC=");
   if (ret == 0) OutputSerial.print(soc, 1); else OutputSerial.print("err");
   OutputSerial.print(" %");
-
-  uint8_t err = 0;
   if (haveChg) {
     OutputSerial.print(" chg=");
     OutputSerial.print(chargeName(chg));
-    OutputSerial.print(" (0x");
-    OutputSerial.print(chg, HEX);
-    OutputSerial.print(")");
   }
-  if (npm1300_charger_error(&err) && err != 0) {
-    OutputSerial.print(" err=0x");
-    OutputSerial.print(err, HEX);
+  if (PRINT_DEBUG && ret == 0) {
+    OutputSerial.print(" | yhat=");  OutputSerial.print(lastInfo.yhat, 3);     // predicted voltage
+    OutputSerial.print(" r0=");     OutputSerial.print(lastInfo.r0, 3);        // resistance estimate
+    OutputSerial.print(" raw=");    OutputSerial.print(lastInfo.soc_raw, 2);   // unrounded SoC
   }
   OutputSerial.println();
-
-  // --- Persistence -------------------------------------------------------
-  static bool wasComplete = false;
-  const bool isComplete = haveChg && (chg & 0x02);
-  if (isComplete && !wasComplete) maybeSaveRecord(true);   // end of a charge
-  wasComplete = isComplete;
-
-  if (now - lastSaveCheck >= SAVE_CHECK_MS) {
-    lastSaveCheck = now;
-    maybeSaveRecord(false);                                 // saves only if it changed
-  }
-
-  // --- Low battery (running on battery only) -----------------------------
-  static uint8_t lowCount   = 0;
-  static bool    lowLatched = false;
-  const bool onBattery = haveVbus && !(vbus & NPM1300_VBUS_STATUS_PRESENT);
-  const bool low = onBattery && ((ret == 0 && soc <= CRITICAL_SOC) || v <= CRITICAL_V);
-
-  if (low) {
-    if (lowCount < 255) lowCount++;
-  } else {
-    lowCount = 0;
-    // re-arm once the battery has recovered or VBUS is back
-    if (lowLatched && (!onBattery || (ret == 0 && soc > CRITICAL_SOC + 5.0f && v > CRITICAL_V + 0.1f))) {
-      lowLatched = false;
-    }
-  }
-
-  if (lowCount >= CRITICAL_COUNT && !lowLatched) {
-    lowLatched = true;
-    OutputSerial.println("CRITICAL BATTERY: saving gauge record");
-    maybeSaveRecord(true);
-    if (SHIP_ON_LOW_BATTERY) {
-      OutputSerial.println("entering ship mode");
-      OutputSerial.flush();
-      npm1300_enter_ship_mode();    // fails (returns false) if VBUS is present
-    }
-  }
 }
+
+#else  // library or model missing
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("nRF Fuel Gauge library or battery_model.inc not found.");
+  Serial.println("See docs/npm1300_fuel_gauge.md.");
+}
+
+void loop() { delay(1000); }
+
+#endif
